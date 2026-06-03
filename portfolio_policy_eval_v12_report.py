@@ -37,6 +37,7 @@ from __future__ import annotations
 import os
 import math
 import random
+import json
 from dataclasses import dataclass
 from typing import Optional
 
@@ -89,6 +90,17 @@ class BacktestConfig:
 
     # If None, initial account equity equals listed portfolio notional at first date.
     initial_account_equity: Optional[float] = None
+
+    # Engine env/config controls.
+    # ENGINE_STARTING_EQUITY supplies account equity when starting from no current units.
+    engine_starting_equity: Optional[float] = None
+
+    # ENGINE_POSITION_SOURCE can be "market" for MARKET_POSITIONS or "zero" for no current units.
+    engine_position_source: str = "market"
+
+    # Optional ENGINE_TARGET_CONTRACT_RATIOS JSON, for example {"MRVL":4,"AVGO":6}.
+    # If unset, target ratios are built from the desired contract plan in MARKET_POSITIONS.
+    engine_target_contract_ratios: Optional[dict[str, float]] = None
 
     # Trading platform cost model:
     # commission_rate is charged on trade notional or trade cash amount.
@@ -188,7 +200,7 @@ class Policy5Config:
     Ratio-constrained hybrid:
         Policy 2 account/risk framework.
         Policy 3 decides candidate add/reduce tickers.
-        Target ratios come from the initial portfolio notional weights.
+        Target ratios come from the desired contract plan, not current holdings.
 
     Restriction:
         - Do not buy a ticker if its current notional weight is already above
@@ -337,6 +349,109 @@ def initial_units_from_positions() -> dict[str, float]:
 
 def all_tickers() -> list[str]:
     return sorted(set(MARKET_MAP.values()))
+
+
+def target_contract_ratios_from_plan() -> dict[str, float]:
+    """Desired contract ratios from the configured contract plan, independent of current holdings."""
+    ratios: dict[str, float] = {t: 0.0 for t in all_tickers()}
+    for market, size in MARKET_POSITIONS:
+        ticker = MARKET_MAP[market]
+        ratios[ticker] = ratios.get(ticker, 0.0) + float(size)
+    return ratios
+
+
+def normalize_target_contract_ratios(ratios: Optional[dict[str, float]]) -> dict[str, float]:
+    """Clean optional target ratios and keep only known tickers with positive ratios."""
+    base = {t: 0.0 for t in all_tickers()}
+    if ratios is None:
+        ratios = target_contract_ratios_from_plan()
+    for ticker, ratio in ratios.items():
+        ticker = str(ticker).upper()
+        if ticker in base:
+            base[ticker] = max(0.0, float(ratio))
+    return base
+
+
+def target_weights_from_contract_ratios(target_contract_ratios: dict[str, float]) -> dict[str, float]:
+    """Target shares are ratio / sum(ratios), not derived from current holdings."""
+    ratios = normalize_target_contract_ratios(target_contract_ratios)
+    total = sum(ratios.values())
+    if total <= 0:
+        return {t: 0.0 for t in all_tickers()}
+    return {t: ratios.get(t, 0.0) / total for t in all_tickers()}
+
+
+def target_contract_counts(
+    prices: pd.Series,
+    account_equity_or_allocation: float,
+    target_contract_ratios: dict[str, float],
+) -> dict[str, float]:
+    """
+    Compute current-price targets from the desired contract ratios.
+
+    target_share = target_contract_ratio / sum(target_contract_ratios)
+    target_notional = account_equity_or_allocation * target_share
+    target_count = target_notional / current_price
+    """
+    target_weights = target_weights_from_contract_ratios(target_contract_ratios)
+    counts: dict[str, float] = {}
+    for t in all_tickers():
+        price = float(prices[t]) if t in prices and pd.notna(prices[t]) else 0.0
+        target_notional = max(0.0, account_equity_or_allocation) * target_weights.get(t, 0.0)
+        counts[t] = target_notional / price if price > 0 else 0.0
+    return counts
+
+
+def initial_equity_from_config(prices: pd.Series, units: dict[str, float], cfg: BacktestConfig) -> float:
+    """Resolve starting equity, using ENGINE_STARTING_EQUITY for zero-unit starts."""
+    if cfg.initial_account_equity is not None:
+        return float(cfg.initial_account_equity)
+    if portfolio_notional(prices, units) <= 0 and cfg.engine_starting_equity is not None:
+        return float(cfg.engine_starting_equity)
+    return portfolio_notional(prices, units)
+
+
+def parse_optional_float_env(name: str) -> Optional[float]:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return None
+    return float(raw)
+
+
+def parse_target_contract_ratios_env(name: str = "ENGINE_TARGET_CONTRACT_RATIOS") -> Optional[dict[str, float]]:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return None
+    parsed = json.loads(raw)
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{name} must be a JSON object mapping tickers to ratios")
+    return {str(ticker).upper(): float(ratio) for ticker, ratio in parsed.items()}
+
+
+def apply_engine_env(cfg: BacktestConfig) -> BacktestConfig:
+    """Apply ENGINE_* environment fields to the backtest config."""
+    starting_equity = parse_optional_float_env("ENGINE_STARTING_EQUITY")
+    if starting_equity is not None:
+        cfg.engine_starting_equity = starting_equity
+        cfg.initial_account_equity = starting_equity
+
+    position_source = os.getenv("ENGINE_POSITION_SOURCE")
+    if position_source is not None and position_source.strip() != "":
+        cfg.engine_position_source = position_source.strip().lower()
+
+    target_ratios = parse_target_contract_ratios_env()
+    if target_ratios is not None:
+        cfg.engine_target_contract_ratios = normalize_target_contract_ratios(target_ratios)
+
+    return cfg
+
+
+def initial_units_from_engine_config(cfg: BacktestConfig) -> dict[str, float]:
+    if cfg.engine_position_source.lower() == "zero":
+        return {t: 0.0 for t in all_tickers()}
+    if cfg.engine_position_source.lower() != "market":
+        raise ValueError('ENGINE_POSITION_SOURCE must be either "market" or "zero"')
+    return initial_units_from_positions()
 
 
 def unit_snapshot(prefix: str, units: dict[str, float]) -> dict[str, float]:
@@ -769,8 +884,7 @@ def simulate_policy_2_profit_pyramid_derisk(
     units = dict(init_units)
     avg_entry = {t: float(first[t]) for t in units}
 
-    initial_notional = portfolio_notional(first, units)
-    initial_equity = cfg.initial_account_equity if cfg.initial_account_equity is not None else initial_notional
+    initial_equity = initial_equity_from_config(first, units, cfg)
 
     balance = initial_equity
     max_equity = initial_equity
@@ -891,7 +1005,7 @@ def simulate_policy_3_sequential(
     cfg3: Policy3SequentialConfig,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
 
-    initial_equity = portfolio_notional(closes.iloc[0], init_units)
+    initial_equity = initial_equity_from_config(closes.iloc[0], init_units, cfg)
     cash = initial_equity
 
     frames = prepare_frames(data, closes, cfg3.confirm_bars)
@@ -1052,8 +1166,7 @@ def simulate_policy_4_signal_guided_pyramid(
     units = dict(init_units)
     avg_entry = {t: float(first[t]) for t in units}
 
-    initial_notional = portfolio_notional(first, units)
-    initial_equity = cfg.initial_account_equity if cfg.initial_account_equity is not None else initial_notional
+    initial_equity = initial_equity_from_config(first, units, cfg)
     balance = initial_equity
 
     frames = prepare_frames(data, closes, cfg4.confirm_bars)
@@ -1291,10 +1404,10 @@ def simulate_policy_5_ratio_guarded_guided_pyramid(
     units = dict(init_units)
     avg_entry = {t: float(first[t]) for t in units}
 
-    target_weights = target_weights_from_initial(first, init_units)
+    target_contract_ratios = normalize_target_contract_ratios(cfg.engine_target_contract_ratios)
+    target_weights = target_weights_from_contract_ratios(target_contract_ratios)
 
-    initial_notional = portfolio_notional(first, units)
-    initial_equity = cfg.initial_account_equity if cfg.initial_account_equity is not None else initial_notional
+    initial_equity = initial_equity_from_config(first, units, cfg)
     balance = initial_equity
 
     frames = prepare_frames(data, closes, cfg5.confirm_bars)
@@ -1385,25 +1498,49 @@ def simulate_policy_5_ratio_guarded_guided_pyramid(
             equity = state["equity"]
             profit_return = equity / initial_equity - 1
 
-            # Guided add with overweight filter.
-            if signals and profit_return >= cfg5.min_profit_to_add:
-                eligible = [
-                    s for s in signals
-                    if not is_ticker_overweight(
-                        r, units, s["ticker"], target_weights, cfg5.max_overweight_ratio
-                    )
-                ]
+            # Guided add with overweight filter. First entries are allowed when the
+            # current count is zero and the current-price target count is positive,
+            # even before profit-pyramiding thresholds have been reached.
+            target_counts = target_contract_counts(r, equity, target_contract_ratios)
+            first_entry_candidates = {
+                t for t, target_count in target_counts.items()
+                if units.get(t, 0.0) <= 1e-12 and target_count > 1e-12
+            }
+            allow_profit_add = profit_return >= cfg5.min_profit_to_add
+
+            if signals and (allow_profit_add or first_entry_candidates):
+                eligible = []
+                for s in signals:
+                    ticker = s["ticker"]
+                    is_first_entry = ticker in first_entry_candidates
+                    if is_first_entry or not is_ticker_overweight(
+                        r, units, ticker, target_weights, cfg5.max_overweight_ratio
+                    ):
+                        candidate = dict(s)
+                        candidate["is_first_entry"] = is_first_entry
+                        eligible.append(candidate)
 
                 if eligible:
                     sig = choose_signal(eligible, cfg5.signal_priority)
                     t = sig["ticker"]
 
+                    current_count = max(0.0, units.get(t, 0.0))
+                    target_count = target_counts.get(t, 0.0)
+                    current_price = float(r[t])
+                    target_notional = max(0.0, equity) * target_weights.get(t, 0.0)
+                    target_gap_notional = max(0.0, (target_count - current_count) * current_price)
                     profit_pool = max(0.0, equity - initial_equity)
                     max_notional = equity * cfg5.max_gross_exposure_to_equity
                     notional_capacity = max(0.0, max_notional - state["notional"])
                     max_margin = equity * cfg5.max_margin_usage
                     margin_capacity = max(0.0, max_margin - state["used_margin"])
-                    desired_add_margin = profit_pool * cfg5.profit_reinvest_fraction
+
+                    if sig.get("is_first_entry", False):
+                        desired_add_margin = target_gap_notional * cfg5.margin_rate
+                        add_reason = "first_entry_to_positive_target_count"
+                    else:
+                        desired_add_margin = profit_pool * cfg5.profit_reinvest_fraction
+                        add_reason = "policy3_buy_signal_and_not_overweight"
 
                     add_margin = min(
                         desired_add_margin,
@@ -1413,6 +1550,7 @@ def simulate_policy_5_ratio_guarded_guided_pyramid(
                     )
 
                     if add_margin > 0:
+                        current_weight_before = current_weights(r, units).get(t, 0.0)
                         units, avg_entry, add_units, trade_fee = add_single_ticker_exposure(
                             r, t, units, avg_entry, add_margin, cfg5.margin_rate, cfg
                         )
@@ -1428,7 +1566,7 @@ def simulate_policy_5_ratio_guarded_guided_pyramid(
                             "policy": "5",
                             "action": "RATIO_GUARDED_GUIDED_ADD",
                             "ticker": t,
-                            "reason": "policy3_buy_signal_and_not_overweight",
+                            "reason": add_reason,
                             "add_margin": add_margin,
                             "add_units": add_units,
                             "fee": trade_fee,
@@ -1436,7 +1574,10 @@ def simulate_policy_5_ratio_guarded_guided_pyramid(
                             "active_H": sig["active_H"],
                             "trigger": sig["trigger"],
                             "target_weight": target_weights.get(t, 0.0),
-                            "current_weight_before": current_weights(r, units).get(t, 0.0),
+                            "target_notional": target_notional,
+                            "target_count": target_count,
+                            "current_count_before": current_count,
+                            "current_weight_before": current_weight_before,
                         })
                 else:
                     # Consume no signal; the same signal can remain relevant later if weights change.
@@ -1864,8 +2005,11 @@ def compute_advanced_metrics(
     share_counts: pd.DataFrame,
     closes: pd.DataFrame,
     init_units: dict[str, float],
+    cfg: BacktestConfig,
 ) -> pd.DataFrame:
-    target_weights = target_weights_from_initial(closes.iloc[0], init_units)
+    target_weights = target_weights_from_contract_ratios(
+        normalize_target_contract_ratios(cfg.engine_target_contract_ratios)
+    )
 
     rows = []
 
@@ -2041,6 +2185,9 @@ def generate_report_md(
     lines.append(f"- Commission rate: `{cfg.commission_rate:.4%}`")
     lines.append(f"- Random adverse slippage max: `{cfg.random_slippage_max_rate:.4%}`")
     lines.append(f"- Random seed: `{cfg.random_seed}`")
+    lines.append(f"- Engine position source: `{cfg.engine_position_source}`")
+    lines.append(f"- Engine starting equity: `{cfg.engine_starting_equity}`")
+    lines.append(f"- Engine target contract ratios: `{normalize_target_contract_ratios(cfg.engine_target_contract_ratios)}`")
     lines.append("")
     lines.append("## Executive Summary")
     lines.append("")
@@ -2131,6 +2278,8 @@ def main() -> None:
         random_seed=42,
     )
 
+    cfg = apply_engine_env(cfg)
+
     random.seed(cfg.random_seed)
     np.random.seed(cfg.random_seed)
 
@@ -2216,7 +2365,7 @@ def main() -> None:
     ensure_dirs(cfg)
     data = download_all(cfg)
     closes = align_closes(data)
-    init_units = initial_units_from_positions()
+    init_units = initial_units_from_engine_config(cfg)
 
     p1 = simulate_policy_1_hold(closes, init_units)
     p2, trades2 = simulate_policy_2_profit_pyramid_derisk(closes, init_units, cfg, cfg2)
@@ -2239,7 +2388,7 @@ def main() -> None:
     summary = summarize(result)
     share_counts = build_share_counts_table(p1, p2, p3, p4, p5)
     fee_table = build_cumulative_fee_table(result, trades)
-    advanced_metrics = compute_advanced_metrics(result, summary, fee_table, share_counts, closes, init_units)
+    advanced_metrics = compute_advanced_metrics(result, summary, fee_table, share_counts, closes, init_units, cfg)
 
     plot_single(
         result,
