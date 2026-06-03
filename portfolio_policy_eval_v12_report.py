@@ -37,8 +37,64 @@ from __future__ import annotations
 import os
 import math
 import random
+import argparse
+import json
+import threading
+import time
+import webbrowser
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote
+from urllib.request import Request, urlopen
+
+
+# ============================================================
+# Environment loading
+# ============================================================
+
+def load_dotenv(path: str = ".env") -> dict[str, str]:
+    """Load KEY=VALUE pairs from .env, overriding process env when values are non-empty."""
+    loaded: dict[str, str] = {}
+    if not os.path.exists(path):
+        return loaded
+
+    with open(path, "r", encoding="utf-8") as file:
+        for raw_line in file:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):].strip()
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            if not key or not value:
+                continue
+            if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
+                value = value[1:-1]
+            os.environ[key] = value
+            loaded[key] = value
+    return loaded
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    return default if value is None else int(value)
+
+
+LOADED_DOTENV = load_dotenv(os.environ.get("QTRADE_ENV_FILE", ".env"))
 
 import numpy as np
 import pandas as pd
@@ -1555,6 +1611,575 @@ def simulate_policy_5_ratio_guarded_guided_pyramid(
     return pd.DataFrame(rows), pd.DataFrame(trades)
 
 
+
+# ============================================================
+# Policy 5 live trading engine and CLI web app
+# ============================================================
+
+@dataclass
+class EngineConfig:
+    yahoo_period: str = "60d"
+    yahoo_interval: str = "15m"
+    poll_seconds: int = 60
+    host: str = "127.0.0.1"
+    port: int = 8765
+    selected_ticker: str = "AVGO"
+    open_browser: bool = True
+    use_ig: bool = True
+    ig_epic_map_json: str = ""
+    enable_live_trading: bool = False
+    deal_size_map_json: str = ""
+    currency_code: str = "USD"
+    expiry: str = "-"
+    force_open: bool = False
+    confirm_deals: bool = True
+
+
+class IGClient:
+    """Minimal IG REST client for session authentication and market snapshots."""
+
+    def __init__(self) -> None:
+        self.username = os.environ.get("IG_SERVICE_USERNAME", "")
+        self.password = os.environ.get("IG_SERVICE_PASSWORD", "")
+        self.api_key = os.environ.get("IG_SERVICE_API_KEY", "")
+        self.acc_type = os.environ.get("IG_SERVICE_ACC_TYPE", "DEMO").upper()
+        self.account_number = os.environ.get("IG_SERVICE_ACC_NUMBER", "")
+        self.base_url = "https://demo-api.ig.com/gateway/deal" if self.acc_type == "DEMO" else "https://api.ig.com/gateway/deal"
+        self.cst = ""
+        self.security_token = ""
+        self.account_switch_error = ""
+
+    def configured(self) -> bool:
+        return all([self.username, self.password, self.api_key, self.acc_type, self.account_number])
+
+    def _request(self, method: str, path: str, payload: Optional[dict] = None, version: str = "2") -> dict:
+        body = None if payload is None else json.dumps(payload).encode("utf-8")
+        headers = {
+            "X-IG-API-KEY": self.api_key,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "VERSION": version,
+        }
+        if self.cst and self.security_token:
+            headers["CST"] = self.cst
+            headers["X-SECURITY-TOKEN"] = self.security_token
+        request = Request(f"{self.base_url}{path}", data=body, headers=headers, method=method)
+        with urlopen(request, timeout=15) as response:
+            if path == "/session":
+                self.cst = response.headers.get("CST", self.cst)
+                self.security_token = response.headers.get("X-SECURITY-TOKEN", self.security_token)
+            raw = response.read().decode("utf-8")
+        return json.loads(raw) if raw else {}
+
+    def login(self) -> None:
+        if not self.configured():
+            raise RuntimeError("IG service environment variables are incomplete")
+        self._request("POST", "/session", {"identifier": self.username, "password": self.password}, version="2")
+        if self.account_number:
+            try:
+                self._request("PUT", "/session", {"accountId": self.account_number, "defaultAccount": False}, version="1")
+            except HTTPError as exc:
+                if exc.code != 412:
+                    raise
+                self.account_switch_error = "IG account switch returned HTTP 412; continuing on the authenticated default account"
+
+    def market_snapshot(self, epic: str) -> dict:
+        return self._request("GET", f"/markets/{quote(epic, safe='')}", version="3")
+
+    def search_markets(self, search_term: str) -> dict:
+        return self._request("GET", f"/markets?searchTerm={quote(search_term, safe='')}", version="1")
+
+    def create_market_position(
+        self,
+        epic: str,
+        direction: str,
+        size: float,
+        currency_code: str,
+        expiry: str = "-",
+        force_open: bool = False,
+    ) -> dict:
+        payload = {
+            "epic": epic,
+            "expiry": expiry,
+            "direction": direction.upper(),
+            "size": round(float(size), 6),
+            "orderType": "MARKET",
+            "currencyCode": currency_code,
+            "forceOpen": bool(force_open),
+            "guaranteedStop": False,
+        }
+        return self._request("POST", "/positions/otc", payload, version="2")
+
+    def confirm_deal(self, deal_reference: str) -> dict:
+        return self._request("GET", f"/confirms/{quote(deal_reference, safe='')}", version="1")
+
+    def open_positions(self) -> dict:
+        return self._request("GET", "/positions", version="2")
+
+
+def download_latest_one(ticker: str, period: str, interval: str) -> pd.DataFrame:
+    raw = yf.download(ticker, period=period, interval=interval, auto_adjust=False, progress=False, prepost=False)
+    if raw.empty:
+        raise RuntimeError(f"No latest Yahoo Finance data downloaded for {ticker}")
+    if isinstance(raw.columns, pd.MultiIndex):
+        raw.columns = [c[0] for c in raw.columns]
+    df = raw.reset_index()
+    date_col = "Datetime" if "Datetime" in df.columns else "Date"
+    df = df.rename(columns={date_col: "date", "Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"})
+    df = df[["date", "open", "high", "low", "close", "volume"]].copy()
+    df["date"] = pd.to_datetime(df["date"])
+    try:
+        if df["date"].dt.tz is not None:
+            df["date"] = df["date"].dt.tz_convert(None)
+    except (AttributeError, TypeError):
+        pass
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df.dropna(subset=["date", "open", "high", "low", "close"]).reset_index(drop=True)
+
+
+def download_latest_all(period: str, interval: str) -> dict[str, pd.DataFrame]:
+    return {ticker: download_latest_one(ticker, period, interval) for ticker in all_tickers()}
+
+
+def parse_json_map(value: str, env_var: str) -> dict:
+    raw = value or os.environ.get(env_var, "")
+    if not raw:
+        return {}
+    if os.path.exists(raw):
+        with open(raw, "r", encoding="utf-8") as file:
+            return json.load(file)
+    return json.loads(raw)
+
+
+def parse_ig_epic_map(value: str) -> dict[str, str]:
+    return {str(k): str(v) for k, v in parse_json_map(value, "IG_EPIC_MAP").items()}
+
+
+def parse_deal_size_map(value: str) -> dict[str, float]:
+    return {str(k): float(v) for k, v in parse_json_map(value, "IG_DEAL_SIZE_MAP").items()}
+
+
+def append_tick_to_15m_bar(df: pd.DataFrame, when: datetime, price: float, volume: float = 0.0) -> pd.DataFrame:
+    bar_time = pd.Timestamp(when).floor("15min").to_pydatetime()
+    out = df.copy()
+    if out.empty or pd.Timestamp(out.iloc[-1]["date"]).to_pydatetime() < bar_time:
+        row = {"date": bar_time, "open": price, "high": price, "low": price, "close": price, "volume": volume}
+        return pd.concat([out, pd.DataFrame([row])], ignore_index=True)
+    if pd.Timestamp(out.iloc[-1]["date"]).to_pydatetime() == bar_time:
+        idx = out.index[-1]
+        out.loc[idx, "high"] = max(float(out.loc[idx, "high"]), price)
+        out.loc[idx, "low"] = min(float(out.loc[idx, "low"]), price)
+        out.loc[idx, "close"] = price
+        out.loc[idx, "volume"] = float(out.loc[idx, "volume"] or 0.0) + volume
+    return out
+
+
+class Policy5TradingEngine:
+    def __init__(self, data: dict[str, pd.DataFrame], cfg: BacktestConfig, cfg5: Policy5Config) -> None:
+        self.data = data
+        self.cfg = cfg
+        self.cfg5 = cfg5
+        self.units = initial_units_from_positions()
+        self.avg_entry: dict[str, float] = {}
+        self.balance = 0.0
+        self.initial_equity = 0.0
+        self.target_weights: dict[str, float] = {}
+        self.max_equity = 0.0
+        self.can_derisk_from_current_peak = True
+        self.guided_H: dict[str, float] = {}
+        self.guided_target_active: dict[str, bool] = {}
+        self.guided_pmax: dict[str, float] = {}
+        self.scanners: dict[str, SignalScannerState] = {}
+        self.last_processed_date: dict[str, pd.Timestamp] = {}
+        self.actions: list[dict] = []
+        self.next_action_id = 1
+        self.latest_state: dict = {}
+        self.lock = threading.Lock()
+        self._initialise_state()
+
+    def _closes(self) -> pd.DataFrame:
+        return align_closes(self.data)
+
+    def _initialise_state(self) -> None:
+        closes = self._closes()
+        first = closes.iloc[0]
+        last = closes.iloc[-1]
+        self.avg_entry = {ticker: float(last[ticker]) for ticker in self.units}
+        self.initial_equity = self.cfg.initial_account_equity if self.cfg.initial_account_equity is not None else portfolio_notional(last, self.units)
+        self.balance = self.initial_equity
+        self.max_equity = self.initial_equity
+        self.target_weights = target_weights_from_initial(last, self.units)
+        frames = prepare_frames(self.data, closes, self.cfg5.confirm_bars)
+        self.scanners = {
+            ticker: SignalScannerState(ticker, self.cfg5.confirm_bars, self.cfg5.max_lows_per_plan, self.cfg5.max_volume_ratio_for_buy, self.cfg5.min_vwma20_slope_5bars, self.cfg5.min_vwma50_slope_5bars)
+            for ticker in frames
+        }
+        for ticker, frame in frames.items():
+            for _, row in frame.iterrows():
+                self.scanners[ticker].update_and_get_signal(row)
+            self.last_processed_date[ticker] = pd.Timestamp(frame.iloc[-1]["date"])
+        self._record_action("ENGINE_INIT", "ALL", "Loaded latest 60 days of Yahoo 15m bars", last["date"], {})
+        self._update_latest_state(closes.iloc[-1])
+
+    def _record_action(self, action: str, ticker: str, reason: str, when, extra: dict) -> dict:
+        event = {"id": self.next_action_id, "when": str(when), "action": action, "ticker": ticker, "reason": reason}
+        self.next_action_id += 1
+        event.update(extra)
+        self.actions.append(event)
+        self.actions = self.actions[-200:]
+        if self.latest_state:
+            self.latest_state["actions"] = list(self.actions)
+        return event
+
+    def ingest_ig_snapshot(self, ticker: str, snapshot: dict) -> None:
+        market = snapshot.get("snapshot", snapshot)
+        bid = market.get("bid") or market.get("bidPrice")
+        offer = market.get("offer") or market.get("offerPrice")
+        price = None
+        if bid is not None and offer is not None:
+            price = (float(bid) + float(offer)) / 2.0
+        elif market.get("lastTraded") is not None:
+            price = float(market["lastTraded"])
+        if price is None or not math.isfinite(price):
+            return
+        with self.lock:
+            self.data[ticker] = append_tick_to_15m_bar(self.data[ticker], datetime.now(timezone.utc), price)
+
+    def evaluate(self) -> dict:
+        with self.lock:
+            closes = self._closes()
+            frames = prepare_frames(self.data, closes, self.cfg5.confirm_bars)
+            prices = closes.iloc[-1]
+            date = prices["date"]
+            state = account_state(prices, self.balance, self.units, self.avg_entry, self.cfg5.margin_rate)
+            equity = state["equity"]
+            if equity > self.max_equity:
+                self.max_equity = equity
+                self.can_derisk_from_current_peak = True
+
+            signals = []
+            for ticker, frame in frames.items():
+                row = frame.iloc[-1]
+                row_date = pd.Timestamp(row["date"])
+                if row_date <= self.last_processed_date.get(ticker, pd.Timestamp.min):
+                    continue
+                signal = self.scanners[ticker].update_and_get_signal(row)
+                self.last_processed_date[ticker] = row_date
+                if signal is not None:
+                    signals.append(signal)
+
+            decision = "HOLD"
+            decision_reason = "No Policy 5 add/reduce condition is active."
+            profit_return = equity / self.initial_equity - 1 if self.initial_equity else 0.0
+
+            if signals and profit_return >= self.cfg5.min_profit_to_add:
+                eligible = [s for s in signals if not is_ticker_overweight(prices, self.units, s["ticker"], self.target_weights, self.cfg5.max_overweight_ratio)]
+                if eligible:
+                    sig = choose_signal(eligible, self.cfg5.signal_priority)
+                    ticker = sig["ticker"]
+                    add_margin = min(
+                        max(0.0, equity - self.initial_equity) * self.cfg5.profit_reinvest_fraction,
+                        max(0.0, equity * self.cfg5.max_margin_usage - state["used_margin"]),
+                        max(0.0, equity * self.cfg5.max_gross_exposure_to_equity - state["notional"]) * self.cfg5.margin_rate,
+                        max(0.0, state["free_margin"]),
+                    )
+                    if add_margin > 0:
+                        self.units, self.avg_entry, add_units, trade_fee = add_single_ticker_exposure(prices, ticker, self.units, self.avg_entry, add_margin, self.cfg5.margin_rate, self.cfg)
+                        self.balance -= trade_fee
+                        self.scanners[ticker].consume_signal_level()
+                        self.guided_H[ticker] = sig["active_H"]
+                        self.guided_target_active[ticker] = False
+                        self.guided_pmax[ticker] = -math.inf
+                        decision = "BUY"
+                        decision_reason = "Policy 5 buy signal passed profit, margin, and target-weight gates."
+                        self._record_action(decision, ticker, decision_reason, date, {"add_units": add_units, "add_margin": add_margin, "trigger": sig["trigger"]})
+                else:
+                    decision = "SKIP_BUY"
+                    decision_reason = "Policy 5 buy signal exists, but every signaled ticker is overweight."
+                    self._record_action(decision, "ALL", decision_reason, date, {"signal_tickers": ",".join(sorted(s["ticker"] for s in signals))})
+            elif signals:
+                decision = "WATCH_BUY"
+                decision_reason = "Policy 5 buy signal exists, but profit gate is not yet open."
+                self._record_action(decision, choose_signal(signals, self.cfg5.signal_priority)["ticker"], decision_reason, date, {"profit_return": profit_return})
+
+            for ticker in list(self.guided_H.keys()):
+                row_t = frames[ticker].iloc[-1]
+                close_t = float(row_t["close"])
+                high_t = float(row_t["high"])
+                H_t = self.guided_H[ticker]
+                avg_t = self.avg_entry[ticker]
+                if not self.guided_target_active.get(ticker, False):
+                    observe = avg_t + self.cfg5.rebound_observe_ratio * (H_t - avg_t)
+                    if high_t >= observe:
+                        self.guided_target_active[ticker] = True
+                        self.guided_pmax[ticker] = max(high_t, close_t)
+                        self._record_action("TARGET_ZONE", ticker, "Guided target zone reached.", date, {"observe_price": observe})
+                if self.guided_target_active.get(ticker, False):
+                    self.guided_pmax[ticker] = max(self.guided_pmax.get(ticker, -math.inf), high_t, close_t)
+                    hit_trailing = close_t <= self.guided_pmax[ticker] * (1 - self.cfg5.trailing_drawdown)
+                    below_vwma10 = self.cfg5.sell_on_close_below_vwma10 and pd.notna(row_t.get("vwma10", np.nan)) and close_t < float(row_t["vwma10"])
+                    if hit_trailing or below_vwma10:
+                        reduce_fraction = max_reduce_fraction_to_respect_lower_band(prices, self.units, ticker, self.target_weights, self.cfg5.max_underweight_ratio, self.cfg5.guided_reduce_fraction)
+                        if reduce_fraction > 0:
+                            self.units, closed_units, realized, trade_fee = close_ticker_fraction(prices, ticker, self.units, self.avg_entry, reduce_fraction, self.cfg)
+                            self.balance += realized - trade_fee
+                            decision = "SELL"
+                            decision_reason = "Policy 5 guided trailing/VWMA reduce condition fired."
+                            self._record_action(decision, ticker, decision_reason, date, {"closed_units": closed_units, "realized_pnl": realized})
+                        else:
+                            decision = "SKIP_SELL"
+                            decision_reason = "Sell condition fired, but lower target-weight band blocked the reduce."
+                            self._record_action(decision, ticker, decision_reason, date, {})
+                        self.guided_target_active[ticker] = False
+                        self.guided_pmax[ticker] = -math.inf
+
+            return self._update_latest_state(prices, decision, decision_reason)
+
+    def _update_latest_state(self, prices: pd.Series, decision: str = "HOLD", reason: str = "Engine initialized.") -> dict:
+        state = account_state(prices, self.balance, self.units, self.avg_entry, self.cfg5.margin_rate)
+        market = {ticker: {"price": float(prices[ticker]), "units": float(self.units.get(ticker, 0.0)), "weight": current_weights(prices, self.units).get(ticker, 0.0)} for ticker in all_tickers()}
+        self.latest_state = {"date": str(prices["date"]), "decision": decision, "reason": reason, "account": state, "market": market, "actions": list(self.actions)}
+        return self.latest_state
+
+
+def render_engine_page(engine: Policy5TradingEngine, selected_ticker: str) -> str:
+    with engine.lock:
+        state = dict(engine.latest_state)
+        df = engine.data.get(selected_ticker, pd.DataFrame()).tail(120).copy()
+    points = []
+    if not df.empty:
+        closes = df["close"].astype(float).tolist()
+        lo, hi = min(closes), max(closes)
+        span = hi - lo if hi != lo else 1.0
+        for idx, value in enumerate(closes):
+            x = 10 + idx * (780 / max(1, len(closes) - 1))
+            y = 230 - ((value - lo) / span) * 200
+            points.append(f"{x:.1f},{y:.1f}")
+    actions = state.get("actions", [])[-30:]
+    action_rows = "".join(f"<tr><td>{a.get('when','')}</td><td>{a.get('ticker','')}</td><td>{a.get('action','')}</td><td>{a.get('reason','')}</td></tr>" for a in reversed(actions))
+    market_rows = "".join(f"<tr><td>{ticker}</td><td>{vals['price']:.4f}</td><td>{vals['units']:.4f}</td><td>{vals['weight']:.2%}</td></tr>" for ticker, vals in state.get("market", {}).items())
+    account = state.get("account", {})
+    return f"""<!doctype html><html><head><meta charset='utf-8'><meta http-equiv='refresh' content='10'>
+<title>Policy 5 Trading Engine</title><style>body{{font-family:Arial,sans-serif;margin:24px;background:#0b1020;color:#edf2ff}}.card{{background:#151b2d;border:1px solid #2f3b5c;border-radius:12px;padding:16px;margin-bottom:16px}}table{{border-collapse:collapse;width:100%}}td,th{{border-bottom:1px solid #2f3b5c;padding:8px;text-align:left}}.decision{{font-size:28px;font-weight:700}}svg{{width:100%;height:250px;background:#090d19;border-radius:8px}}polyline{{fill:none;stroke:#6ee7b7;stroke-width:2}}</style></head>
+<body><h1>Policy 5 Trading Engine</h1><div class='card'><div class='decision'>{state.get('decision','HOLD')} {selected_ticker}</div><p>{state.get('reason','')}</p><p>Latest bar: {state.get('date','')}</p><p>Equity: {account.get('equity',0):,.2f} | Free margin: {account.get('free_margin',0):,.2f} | Margin usage: {account.get('margin_usage',0):.2%}</p></div>
+<div class='card'><h2>{selected_ticker} market line</h2><svg viewBox='0 0 800 250'><polyline points='{' '.join(points)}'></polyline></svg></div>
+<div class='card'><h2>Where / what / when actions</h2><table><tr><th>When</th><th>Where</th><th>What</th><th>Why</th></tr>{action_rows}</table></div>
+<div class='card'><h2>Current market and simulated position</h2><table><tr><th>Ticker</th><th>Price</th><th>Units</th><th>Weight</th></tr>{market_rows}</table></div></body></html>"""
+
+
+def make_engine_handler(engine: Policy5TradingEngine, selected_ticker: str):
+    class EngineHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            if self.path.startswith("/state"):
+                body = json.dumps(engine.latest_state, default=str).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            body = render_engine_page(engine, selected_ticker).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format: str, *args) -> None:
+            return
+    return EngineHandler
+
+
+def resolve_live_order_size(event: dict, deal_size_map: dict[str, float]) -> float:
+    ticker = str(event.get("ticker", ""))
+    if ticker in deal_size_map:
+        return max(0.0, float(deal_size_map[ticker]))
+    if event.get("action") == "BUY":
+        return max(0.0, float(event.get("add_units", 0.0)))
+    if event.get("action") == "SELL":
+        return max(0.0, float(event.get("closed_units", 0.0)))
+    return 0.0
+
+
+def execute_pending_live_orders(
+    engine: Policy5TradingEngine,
+    ig_client: IGClient,
+    snapshot: dict,
+    epic_map: dict[str, str],
+    deal_size_map: dict[str, float],
+    executed_action_ids: set[int],
+    engine_cfg: EngineConfig,
+    ig_ready: bool,
+) -> None:
+    if not ig_ready:
+        for event in snapshot.get("actions", []):
+            if event.get("action") in {"BUY", "SELL"} and int(event.get("id", 0)) not in executed_action_ids:
+                executed_action_ids.add(int(event.get("id", 0)))
+                with engine.lock:
+                    engine._record_action("LIVE_ORDER_SKIPPED", str(event.get("ticker", "")), "IG session is not ready; live order was not submitted.", datetime.now(timezone.utc), {"source_action_id": event.get("id")})
+        return
+
+    for event in snapshot.get("actions", []):
+        action_id = int(event.get("id", 0))
+        action = event.get("action")
+        ticker = str(event.get("ticker", ""))
+        if action_id in executed_action_ids or action not in {"BUY", "SELL"}:
+            continue
+        executed_action_ids.add(action_id)
+        epic = epic_map.get(ticker)
+        if not epic:
+            with engine.lock:
+                engine._record_action("LIVE_ORDER_SKIPPED", ticker, "No IG epic mapping exists for this ticker.", datetime.now(timezone.utc), {"source_action_id": action_id})
+            continue
+        size = resolve_live_order_size(event, deal_size_map)
+        if size <= 0:
+            with engine.lock:
+                engine._record_action("LIVE_ORDER_SKIPPED", ticker, "Resolved IG order size is zero.", datetime.now(timezone.utc), {"source_action_id": action_id})
+            continue
+        direction = "BUY" if action == "BUY" else "SELL"
+        try:
+            ticket = ig_client.create_market_position(
+                epic=epic,
+                direction=direction,
+                size=size,
+                currency_code=engine_cfg.currency_code,
+                expiry=engine_cfg.expiry,
+                force_open=engine_cfg.force_open,
+            )
+            deal_reference = ticket.get("dealReference", "")
+            confirmation = {}
+            if engine_cfg.confirm_deals and deal_reference:
+                confirmation = ig_client.confirm_deal(deal_reference)
+            with engine.lock:
+                engine._record_action(
+                    "LIVE_ORDER_SUBMITTED",
+                    ticker,
+                    f"Submitted IG {direction} market order from Policy 5 {action} action.",
+                    datetime.now(timezone.utc),
+                    {
+                        "source_action_id": action_id,
+                        "epic": epic,
+                        "direction": direction,
+                        "size": size,
+                        "deal_reference": deal_reference,
+                        "deal_status": confirmation.get("dealStatus", "UNCONFIRMED"),
+                        "reason_code": confirmation.get("reason", ""),
+                    },
+                )
+        except (HTTPError, URLError, TimeoutError, ValueError) as exc:
+            with engine.lock:
+                engine._record_action("LIVE_ORDER_ERROR", ticker, str(exc), datetime.now(timezone.utc), {"source_action_id": action_id, "epic": epic, "direction": direction, "size": size})
+
+
+def run_trading_engine(args: argparse.Namespace) -> None:
+    engine_cfg = EngineConfig(
+        yahoo_period=args.yahoo_period,
+        yahoo_interval=args.interval,
+        poll_seconds=args.poll_seconds,
+        host=args.host,
+        port=args.port,
+        selected_ticker=args.ticker,
+        open_browser=not args.no_browser,
+        use_ig=not args.no_ig,
+        ig_epic_map_json=args.ig_epic_map,
+        enable_live_trading=args.enable_live_trading,
+        deal_size_map_json=args.ig_deal_size_map,
+        currency_code=args.currency_code,
+        expiry=args.expiry,
+        force_open=args.force_open,
+        confirm_deals=not args.no_confirm_deals,
+    )
+    cfg = BacktestConfig(start="", end="", interval=engine_cfg.yahoo_interval, random_seed=42)
+    cfg5 = Policy5Config()
+    random.seed(cfg.random_seed)
+    np.random.seed(cfg.random_seed)
+    print(f"Loading latest {engine_cfg.yahoo_period} of {engine_cfg.yahoo_interval} Yahoo Finance bars...")
+    data = download_latest_all(engine_cfg.yahoo_period, engine_cfg.yahoo_interval)
+    engine = Policy5TradingEngine(data, cfg, cfg5)
+
+    ig_client = IGClient()
+    epic_map = parse_ig_epic_map(engine_cfg.ig_epic_map_json)
+    deal_size_map = parse_deal_size_map(engine_cfg.deal_size_map_json)
+    executed_action_ids: set[int] = set()
+    ig_ready = False
+    if engine_cfg.use_ig:
+        if ig_client.configured() and epic_map:
+            try:
+                ig_client.login()
+                ig_ready = True
+                print("IG REST session opened; mapped IG markets will cumulate into 15m bars.")
+                if ig_client.account_switch_error:
+                    print(ig_client.account_switch_error)
+                if engine_cfg.enable_live_trading:
+                    print("LIVE IG ORDER EXECUTION ENABLED: BUY/SELL policy events will submit market orders.")
+            except (RuntimeError, HTTPError, URLError, TimeoutError) as exc:
+                print(f"IG login failed; continuing with Yahoo refresh only: {exc}")
+        else:
+            print("IG credentials or IG_EPIC_MAP are missing; continuing with Yahoo refresh only.")
+
+    server = ThreadingHTTPServer((engine_cfg.host, engine_cfg.port), make_engine_handler(engine, engine_cfg.selected_ticker))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    url = f"http://{engine_cfg.host}:{engine_cfg.port}/"
+    print(f"Policy 5 trading engine web page: {url}")
+    if engine_cfg.open_browser:
+        webbrowser.open(url)
+
+    try:
+        while True:
+            if ig_ready:
+                for ticker, epic in epic_map.items():
+                    if ticker in engine.data:
+                        try:
+                            engine.ingest_ig_snapshot(ticker, ig_client.market_snapshot(epic))
+                        except (HTTPError, URLError, TimeoutError, ValueError) as exc:
+                            engine._record_action("IG_POLL_ERROR", ticker, str(exc), datetime.now(timezone.utc), {})
+            snapshot = engine.evaluate()
+            if engine_cfg.enable_live_trading:
+                execute_pending_live_orders(engine, ig_client, snapshot, epic_map, deal_size_map, executed_action_ids, engine_cfg, ig_ready)
+            print(f"{snapshot['date']} {snapshot['decision']}: {snapshot['reason']}")
+            if args.once:
+                break
+            time.sleep(engine_cfg.poll_seconds)
+    finally:
+        server.shutdown()
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Policy 5 backtester and live trading-engine monitor.")
+    sub = parser.add_subparsers(dest="command")
+    engine = sub.add_parser("engine", help="Start the Policy 5 CLI/web trading engine.")
+    engine.add_argument("--yahoo-period", default=os.environ.get("ENGINE_YAHOO_PERIOD", "60d"), help="Yahoo Finance lookback used on init; default: 60d or ENGINE_YAHOO_PERIOD.")
+    engine.add_argument("--interval", default=os.environ.get("ENGINE_INTERVAL", "15m"), help="Yahoo/engine bar interval; default: 15m or ENGINE_INTERVAL.")
+    engine.add_argument("--poll-seconds", type=int, default=env_int("ENGINE_POLL_SECONDS", 60), help="Realtime polling cadence; default: 60 or ENGINE_POLL_SECONDS.")
+    engine.add_argument("--host", default=os.environ.get("ENGINE_HOST", "127.0.0.1"), help="Web server host; default: ENGINE_HOST or 127.0.0.1.")
+    engine.add_argument("--port", type=int, default=env_int("ENGINE_PORT", 8765), help="Web server port; default: ENGINE_PORT or 8765.")
+    engine.add_argument("--ticker", default=os.environ.get("ENGINE_TICKER", "AVGO"), choices=all_tickers(), help="Ticker to draw as the main market line; default: ENGINE_TICKER or AVGO.")
+    engine.add_argument("--ig-epic-map", default=os.environ.get("IG_EPIC_MAP", ""), help="JSON string or file mapping Yahoo tickers to IG epics; defaults to IG_EPIC_MAP env.")
+    engine.add_argument("--no-ig", action="store_true", default=env_bool("ENGINE_NO_IG", False), help="Disable IG realtime polling; can default from ENGINE_NO_IG.")
+    engine.add_argument("--no-browser", action="store_true", default=env_bool("ENGINE_NO_BROWSER", False), help="Do not open a browser tab on start; can default from ENGINE_NO_BROWSER.")
+    engine.add_argument("--once", action="store_true", help="Run one engine evaluation, useful for smoke tests.")
+    engine.add_argument("--enable-live-trading", action="store_true", default=env_bool("ENGINE_ENABLE_LIVE_TRADING", False), help="Submit IG market orders for Policy 5 BUY/SELL events. Default is monitor/paper mode or ENGINE_ENABLE_LIVE_TRADING.")
+    engine.add_argument("--ig-deal-size-map", default=os.environ.get("IG_DEAL_SIZE_MAP", ""), help="JSON string or file mapping tickers to fixed IG order sizes; defaults to IG_DEAL_SIZE_MAP env.")
+    engine.add_argument("--currency-code", default=os.environ.get("IG_CURRENCY_CODE", "USD"), help="Currency code for IG deal tickets; default: IG_CURRENCY_CODE or USD.")
+    engine.add_argument("--expiry", default=os.environ.get("IG_EXPIRY", "-"), help="IG expiry for deal tickets; default IG_EXPIRY or '-' for DFB/cash markets.")
+    engine.add_argument("--force-open", action="store_true", default=env_bool("IG_FORCE_OPEN", False), help="Set IG forceOpen=true on submitted orders instead of allowing opposite trades to reduce exposure; can default from IG_FORCE_OPEN.")
+    engine.add_argument("--no-confirm-deals", action="store_true", default=env_bool("IG_NO_CONFIRM_DEALS", False), help="Skip IG deal confirmation lookup after order submission; can default from IG_NO_CONFIRM_DEALS.")
+    sub.add_parser("backtest", help="Run the original v12 policy backtest/report workflow.")
+    parser.set_defaults(command="engine")
+    return parser
+
+
+def main() -> None:
+    parser = build_arg_parser()
+    args = parser.parse_args()
+    if args.command == "backtest":
+        run_backtest()
+    else:
+        run_trading_engine(args)
+
+
 # ============================================================
 # Plotting/output
 # ============================================================
@@ -2112,7 +2737,7 @@ def summarize(result: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def main() -> None:
+def run_backtest() -> None:
     cfg = BacktestConfig(
         start="2026-04-05",
         end="2026-05-31",
@@ -2387,6 +3012,8 @@ def main() -> None:
     print(f"  {cfg.plot_dir}/policy_5_cumulative_commission_fee_v12.png")
     print(f"  {cfg.plot_dir}/metric_comparison_grid_v12.png")
     print(f"  report: {report_path}")
+
+
 
 
 if __name__ == "__main__":
