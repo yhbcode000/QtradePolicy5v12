@@ -34,6 +34,7 @@ Run:
 
 from __future__ import annotations
 
+import argparse
 import os
 import math
 import random
@@ -2112,7 +2113,40 @@ def summarize(result: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def main() -> None:
+def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
+    """Parse CLI arguments for direct script and console-entry usage."""
+    parser = argparse.ArgumentParser(
+        prog="qtrade-policy5",
+        description="Run the Qtrade Policy 5 v12 portfolio policy evaluation engine.",
+    )
+    parser.add_argument(
+        "command",
+        nargs="?",
+        default="engine",
+        choices=["engine"],
+        help="Command to run. Defaults to the backtest engine.",
+    )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Run one engine cycle. This is the current default behavior.",
+    )
+    parser.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="Compatibility flag; the engine does not open a browser.",
+    )
+    parser.add_argument(
+        "--no-ig",
+        action="store_true",
+        help="Compatibility flag; the engine does not use IG integrations.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Optional[list[str]] = None) -> None:
+    parse_args(argv)
+
     cfg = BacktestConfig(
         start="2026-04-05",
         end="2026-05-31",
