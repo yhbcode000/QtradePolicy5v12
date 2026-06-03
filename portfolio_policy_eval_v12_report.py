@@ -38,8 +38,9 @@ import os
 import math
 import random
 import json
+import argparse
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 import pandas as pd
@@ -76,6 +77,126 @@ MARKET_MAP = {
     "Marvell Technology Group Ltd (24 Hours)": "MRVL",
     "COHERENT CORP": "COHR",
 }
+
+
+# Optional IG epic mapping for live engine synchronization.
+# Fill with platform epics when using IG live mode, e.g. {"AVGO": "..."}.
+IG_EPIC_MAP: dict[str, str] = {}
+
+ENGINE_POSITION_SOURCES = {"ig", "manual", "zero"}
+
+
+def is_ig_configured() -> bool:
+    """Return True when enough IG credentials are present for a live account sync."""
+    return all(os.getenv(name) for name in ("IG_USERNAME", "IG_PASSWORD", "IG_API_KEY"))
+
+
+def normalize_engine_position_source(
+    source: str | None = None,
+    *,
+    ig_configured: bool | None = None,
+    mode: str | None = None,
+) -> str:
+    """
+    Resolve the engine's initial-position source.
+
+    Explicit CLI/env values win.  Without an explicit value, prefer an IG account
+    sync whenever IG is configured; otherwise keep the hand-entered portfolio only
+    for backtest/paper modes and fall back to zero units for live-like modes.
+    """
+    raw_source = source or os.getenv("ENGINE_POSITION_SOURCE")
+    if raw_source:
+        normalized = raw_source.strip().lower()
+        if normalized not in ENGINE_POSITION_SOURCES:
+            raise ValueError(
+                "ENGINE_POSITION_SOURCE must be one of "
+                f"{sorted(ENGINE_POSITION_SOURCES)}, got {raw_source!r}"
+            )
+        return normalized
+
+    configured = is_ig_configured() if ig_configured is None else ig_configured
+    if configured:
+        return "ig"
+
+    normalized_mode = (mode or os.getenv("ENGINE_MODE") or "paper").strip().lower()
+    if normalized_mode in {"backtest", "paper"}:
+        return "manual"
+    return "zero"
+
+
+def _lookup_ticker_for_epic(epic: str, epic_map: dict[str, str]) -> str | None:
+    if epic in epic_map:
+        return epic_map[epic]
+    for ticker, mapped_epic in epic_map.items():
+        if mapped_epic == epic:
+            return ticker
+    if epic in MARKET_MAP:
+        return MARKET_MAP[epic]
+    if epic in set(MARKET_MAP.values()):
+        return epic
+    return None
+
+
+def units_from_ig_open_positions(
+    positions: Any,
+    epic_map: dict[str, str],
+) -> dict[str, float]:
+    """
+    Convert IG open-position payloads into ticker -> signed contract counts.
+
+    BUY positions add units, SELL positions subtract units.  The helper accepts
+    either the raw IG response with a ``positions`` list or a positions list.
+    ``epic_map`` may be either ticker -> epic or epic -> ticker.
+    """
+    raw_positions = positions.get("positions", positions) if isinstance(positions, dict) else positions
+    units: dict[str, float] = {}
+
+    for item in raw_positions or []:
+        market = item.get("market", {}) if isinstance(item, dict) else {}
+        position = item.get("position", {}) if isinstance(item, dict) else {}
+
+        epic = (
+            market.get("epic")
+            or position.get("epic")
+            or (item.get("epic") if isinstance(item, dict) else None)
+        )
+        if not epic:
+            continue
+
+        ticker = _lookup_ticker_for_epic(str(epic), epic_map)
+        if not ticker:
+            continue
+
+        direction = str(
+            position.get("direction")
+            or (item.get("direction") if isinstance(item, dict) else "")
+            or "BUY"
+        ).upper()
+        raw_size = (
+            position.get("size")
+            or position.get("dealSize")
+            or position.get("contractSize")
+            or (item.get("size") if isinstance(item, dict) else None)
+            or 0.0
+        )
+        size = float(raw_size)
+        signed_size = -size if direction == "SELL" else size
+        units[ticker] = units.get(ticker, 0.0) + signed_size
+
+    return units
+
+
+def current_positions_synced_action(source: str, units: dict[str, float]) -> dict[str, Any]:
+    """Dashboard/audit action showing the account state was checked first."""
+    tickers = sorted(units)
+    counts = {ticker: float(units[ticker]) for ticker in tickers}
+    return {
+        "action": "CURRENT_POSITIONS_SYNCED",
+        "source": source,
+        "tickers": ",".join(tickers),
+        "counts": counts,
+        "fee": 0.0,
+    }
 
 
 # ============================================================
@@ -243,6 +364,104 @@ class Policy5Config:
     enable_hard_exit: bool = False
     hard_exit_drawdown_from_peak: float = 0.20
 
+
+class IGClient:
+    """Minimal IG client interface used by the live Policy 5 engine path."""
+
+    def login(self) -> None:
+        raise NotImplementedError("Configure a concrete IGClient before live trading.")
+
+    def open_positions(self) -> Any:
+        raise NotImplementedError("Configure a concrete IGClient before live trading.")
+
+
+class Policy5TradingEngine:
+    """
+    Lightweight live-engine state container for Policy 5.
+
+    The historical simulations still use ``simulate_policy_5_ratio_guarded_guided_pyramid``.
+    This class holds the synchronized live starting units so order decisions can
+    use the current IG account state instead of stale ``MARKET_POSITIONS`` data.
+    """
+
+    def __init__(
+        self,
+        cfg: BacktestConfig | None = None,
+        cfg5: Policy5Config | None = None,
+        *,
+        initial_units: dict[str, float] | None = None,
+        position_source: str = "manual",
+    ):
+        self.cfg = cfg or BacktestConfig()
+        self.cfg5 = cfg5 or Policy5Config()
+        self.position_source = position_source
+        self.units = dict(initial_units) if initial_units is not None else initial_units_from_positions()
+        self.actions: list[dict[str, Any]] = []
+        self.record_current_positions_synced(position_source, self.units)
+
+    def record_action(self, action: dict[str, Any]) -> None:
+        self.actions.append(action)
+
+    def record_current_positions_synced(self, source: str, units: dict[str, float]) -> None:
+        self.record_action(current_positions_synced_action(source, units))
+
+
+def synchronized_initial_units(
+    *,
+    source: str,
+    ig_client: IGClient | None = None,
+    epic_map: dict[str, str] | None = None,
+) -> dict[str, float]:
+    """Fetch or construct the units used to initialize ``Policy5TradingEngine``."""
+    if source == "ig":
+        if ig_client is None:
+            raise ValueError("ig_client is required when ENGINE_POSITION_SOURCE=ig")
+        positions = ig_client.open_positions()
+        return units_from_ig_open_positions(positions, epic_map or IG_EPIC_MAP)
+    if source == "manual":
+        return initial_units_from_positions()
+    if source == "zero":
+        return {ticker: 0.0 for ticker in all_tickers()}
+    raise ValueError(f"Unknown engine position source: {source!r}")
+
+
+def run_trading_engine(
+    *,
+    ig_client: IGClient | None = None,
+    position_source: str | None = None,
+    epic_map: dict[str, str] | None = None,
+    mode: str | None = None,
+    cfg: BacktestConfig | None = None,
+    cfg5: Policy5Config | None = None,
+) -> Policy5TradingEngine:
+    """
+    Initialize the live Policy 5 trading engine after synchronizing positions.
+
+    When IG is selected, this logs in, calls ``IGClient.open_positions()``, maps
+    those positions to ticker units, records ``CURRENT_POSITIONS_SYNCED``, and
+    only then returns an engine ready for live order decisions.
+    """
+    source = normalize_engine_position_source(
+        position_source,
+        ig_configured=ig_client is not None or is_ig_configured(),
+        mode=mode,
+    )
+    if source == "ig":
+        if ig_client is None:
+            ig_client = IGClient()
+        ig_client.login()
+
+    initial_units = synchronized_initial_units(
+        source=source,
+        ig_client=ig_client,
+        epic_map=epic_map or IG_EPIC_MAP,
+    )
+    return Policy5TradingEngine(
+        cfg=cfg,
+        cfg5=cfg5,
+        initial_units=initial_units,
+        position_source=source,
+    )
 
 # ============================================================
 # Data
@@ -2259,7 +2478,31 @@ def summarize(result: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Portfolio Policy 5 v12 evaluator")
+    parser.add_argument(
+        "--engine-position-source",
+        choices=sorted(ENGINE_POSITION_SOURCES),
+        default=None,
+        help=(
+            "Initial live-engine position source. Overrides ENGINE_POSITION_SOURCE. "
+            "Defaults to ig when IG is configured, otherwise manual for paper/backtest."
+        ),
+    )
+    parser.add_argument(
+        "--engine-mode",
+        default=os.getenv("ENGINE_MODE", "paper"),
+        help="Engine mode used when defaulting the position source (paper, backtest, or live).",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
+    args = parse_args()
+    if args.engine_position_source:
+        os.environ["ENGINE_POSITION_SOURCE"] = args.engine_position_source
+    os.environ["ENGINE_MODE"] = args.engine_mode
+
     cfg = BacktestConfig(
         start="2026-04-05",
         end="2026-05-31",
