@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qtrade-policy5"
+version = "0.1.0"
+description = "Qtrade Policy 5 v12 portfolio strategy evaluator and report generator."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+dependencies = [
+    "matplotlib",
+    "numpy",
+    "pandas",
+    "yfinance",
+]
+
+[project.scripts]
+qtrade-policy5 = "portfolio_policy_eval_v12_report:main"
+
+[tool.setuptools]
+py-modules = ["portfolio_policy_eval_v12_report"]

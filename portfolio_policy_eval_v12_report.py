@@ -34,10 +34,10 @@ Run:
 
 from __future__ import annotations
 
+import argparse
 import os
 import math
 import random
-import argparse
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -2331,8 +2331,30 @@ def summarize(result: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Portfolio Policy 5 v12 evaluator")
+    parser.add_argument(
+        "command",
+        nargs="?",
+        default="engine",
+        choices=["engine"],
+        help="Command to run. Defaults to the backtest engine.",
+    )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Run one engine cycle. This is the current default behavior.",
+    )
+    parser.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="Compatibility flag; the engine does not open a browser.",
+    )
+    parser.add_argument(
+        "--no-ig",
+        action="store_true",
+        help="Compatibility flag; the engine does not use IG integrations.",
+    )
     parser.add_argument(
         "--engine-position-source",
         choices=sorted(ENGINE_POSITION_SOURCES),
@@ -2347,11 +2369,11 @@ def parse_args() -> argparse.Namespace:
         default=os.getenv("ENGINE_MODE", "paper"),
         help="Engine mode used when defaulting the position source (paper, backtest, or live).",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main() -> None:
-    args = parse_args()
+def main(argv: Optional[list[str]] = None) -> None:
+    args = parse_args(argv)
     if args.engine_position_source:
         os.environ["ENGINE_POSITION_SOURCE"] = args.engine_position_source
     os.environ["ENGINE_MODE"] = args.engine_mode
